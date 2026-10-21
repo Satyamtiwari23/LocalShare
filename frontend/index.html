@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>LocalShare — Your personal file-sharing server</title>
+    <meta name="description"
+        content="LocalShare turns a folder on your Mac into a lightweight local file server you can open from any device on your Wi-Fi network." />
+    <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+
+    <!-- Scroll progress indicator -->
+    <div class="scroll-progress" id="scrollProgress" aria-hidden="true"></div>
+
+    <!-- Ambient background -->
+    <div class="bg-layer" aria-hidden="true">
+        <span class="orb orb--1" data-parallax="0.10"></span>
+        <span class="orb orb--2" data-parallax="0.20"></span>
+        <span class="orb orb--3" data-parallax="0.06"></span>
+        <span class="grid-lines"></span>
+    </div>
+
+    <!-- ============================= NAVBAR ============================= -->
+    <header class="nav" id="nav">
+        <div class="nav__inner">
+            <a class="brand" href="#top" aria-label="LocalShare home">
+                <span class="brand__mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"
+                        stroke-linejoin="round">
+                        <path
+                            d="M3 8.2A2.2 2.2 0 0 1 5.2 6h3.4a2 2 0 0 1 1.5.7l1.1 1.3h6.6A2.2 2.2 0 0 1 20 10.2v6.6A2.2 2.2 0 0 1 17.8 19H5.2A2.2 2.2 0 0 1 3 16.8z" />
+                        <path d="M12 16.2V11.6" />
+                        <path d="M9.9 13.6 12 11.5l2.1 2.1" />
+                    </svg>
+                </span>
+                <span class="brand__text">
+                    <span class="brand__name">LocalShare</span>
+                    <span class="brand__tagline">Your personal file-sharing server</span>
+                </span>
+            </a>
+
+            <div class="backend-pill" id="backendPill" data-state="unknown" role="status" aria-live="polite">
+                <span class="backend-pill__dot" aria-hidden="true"></span>
+                <span class="backend-pill__text" id="backendText">Checking backend…</span>
+            </div>
+        </div>
+    </header>
+
+    <main id="top">
+
+        <!-- ============================= HERO ============================= -->
+        <section class="hero">
+            <div class="hero__inner" id="heroInner">
+                <span class="eyebrow reveal" style="--d:60ms">
+                    <span class="eyebrow__dot" aria-hidden="true"></span>
+                    Designed for local file sharing
+                </span>
+
+                <h1 class="hero__title reveal" style="--d:140ms">
+                    Share files.<br />
+                    <span class="grad-text">Without the hassle.</span>
+                </h1>
+
+                <p class="hero__desc reveal" style="--d:220ms">
+                    Turn a folder on your Mac into a lightweight file server in seconds. Pick a folder,
+                    start hosting, and open the link from your phone, tablet, or another computer —
+                    no cloud uploads, no accounts, no setup wizards.
+                </p>
+
+                <div class="hero__actions reveal" style="--d:300ms">
+                    <a class="btn btn--primary" href="#server">Open server controls</a>
+                    <a class="btn btn--ghost" href="#how">How it works</a>
+                </div>
+
+                <ul class="hero__meta reveal" style="--d:380ms">
+                    <li>Local Wi-Fi only</li>
+                    <li>Runs on your Mac</li>
+                    <li>Nothing uploaded</li>
+                </ul>
+            </div>
+
+            <a class="scroll-cue" href="#server" aria-label="Scroll to server controls">
+                <span class="scroll-cue__line" aria-hidden="true"></span>
+                <span class="scroll-cue__text">Scroll</span>
+            </a>
+        </section>
+
+        <!-- ========================= SERVER CONTROL ======================= -->
+        <section class="section" id="server">
+            <div class="section__head reveal">
+                <span class="section__kicker">Control panel</span>
+                <h2>Server control</h2>
+                <p>Start and stop the file server running on your Mac.</p>
+            </div>
+
+            <div class="card control-card reveal" id="controlCard" data-status="stopped">
+
+                <!-- Hosting status -->
+                <div class="status-block">
+                    <div class="status-line" role="status" aria-live="polite">
+                        <span class="status-dot" id="statusDot" data-status="stopped" aria-hidden="true"></span>
+                        <span class="status-text" id="statusText">Stopped</span>
+                        <span class="spinner spinner--sm" id="statusSpinner" hidden aria-hidden="true"></span>
+                    </div>
+
+                    <div class="alert alert--error" id="errorBox" role="alert" hidden></div>
+                </div>
+
+                <!-- Shared folder -->
+                <div class="folder-block">
+                    <div class="folder-block__icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+                            stroke-linecap="round" stroke-linejoin="round">
+                            <path
+                                d="M3 8.2A2.2 2.2 0 0 1 5.2 6h3.4a2 2 0 0 1 1.5.7l1.1 1.3h6.6A2.2 2.2 0 0 1 20 10.2v6.6A2.2 2.2 0 0 1 17.8 19H5.2A2.2 2.2 0 0 1 3 16.8z" />
+                        </svg>
+                    </div>
+
+                    <div class="folder-block__body">
+                        <span class="label">Shared Directory</span>
+                        <span class="folder-path is-empty" id="folderPath">No folder selected</span>
+                        <p class="hint">
+                            Only the folder you select is shared. Your Mac's filesystem is never exposed
+                            as a whole, and the backend validates the directory before serving anything.
+                        </p>
+                    </div>
+
+                    <button class="btn btn--secondary" id="chooseFolderBtn" type="button">
+                        Choose Folder
+                    </button>
+                </div>
+
+                <!-- Controls -->
+                <div class="controls">
+                    <button class="btn btn--primary" id="startBtn" type="button">Start Hosting</button>
+                    <button class="btn btn--danger" id="stopBtn" type="button" disabled>Stop Hosting</button>
+
+                    <div class="loading-indicator" id="loadingIndicator" hidden role="status" aria-live="polite">
+                        <span class="spinner" aria-hidden="true"></span>
+                        <span id="loadingText">Working…</span>
+                    </div>
+                </div>
+
+
+            </div>
+        </section>
+
+        <!-- ========================= FILE UPLOAD ========================= -->
+        <section class="section" id="uploadSection">
+            <div class="section__head reveal">
+                <span class="section__kicker">Upload files</span>
+                <h2>Choose files to share</h2>
+                <p>Select files from your Mac and upload them to your active sharing session.</p>
+            </div>
+
+            <div class="card upload-card">
+                <div class="upload-area" id="uploadArea">
+                    <div class="folder-block__icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+                            stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 16V4" />
+                            <path d="m7 9 5-5 5 5" />
+                            <path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4" />
+                        </svg>
+                    </div>
+
+                    <h3>Select files from your Mac</h3>
+                    <p>Files will be uploaded to your active LocalShare session.</p>
+
+                    <input type="file" id="fileInput" multiple hidden aria-label="Choose files to upload" />
+
+                    <button class="btn btn--secondary" id="selectFilesBtn" type="button">
+                        Select Files
+                    </button>
+
+                    <p class="hint" id="selectedFilesText">No files selected</p>
+                </div>
+
+                <div id="uploadFileList" aria-live="polite"></div>
+
+                <div class="controls">
+                    <button class="btn btn--primary" id="uploadFilesBtn" type="button" disabled>
+                        Upload Files
+                    </button>
+                </div>
+
+                <div class="alert alert--error" id="uploadError" role="alert" hidden></div>
+                <div class="alert" id="uploadMessage" role="status" aria-live="polite" hidden></div>
+            </div>
+        </section>
+
+
+        <!-- ========================= SHARING LINK ========================= -->
+        <section class="section" id="shareSection" hidden>
+            <div class="section__head">
+                <span class="section__kicker">Ready to share</span>
+                <h2>Your Sharing Link</h2>
+                <p>Open this address on another device to browse the shared folder.</p>
+            </div>
+
+            <div class="card share-card">
+                <div class="share-field">
+                    <input type="text" id="shareUrl" class="share-input" readonly value=""
+                        placeholder="Waiting for the server…" aria-label="Sharing link" spellcheck="false" />
+                    <button class="btn btn--secondary" id="copyBtn" type="button">
+                        <span id="copyBtnLabel">Copy Link</span>
+                    </button>
+                    <button class="btn btn--ghost" id="openBtn" type="button">Open Link</button>
+                </div>
+
+                <div class="share-meta">
+                    <span class="badge" id="linkScope">—</span>
+                    <span class="share-hint">
+                        Open the link on another device connected to the same network.
+                    </span>
+                </div>
+
+                <p class="alert alert--warn" id="linkMessage" hidden></p>
+            </div>
+        </section>
+
+        <!-- ====================== CONNECTION INFORMATION ================== -->
+        <section class="section" id="connection">
+            <div class="section__head reveal">
+                <span class="section__kicker">Live details</span>
+                <h2>Connection information</h2>
+                <p>Values are reported by the backend. Nothing here is guessed by the browser.</p>
+            </div>
+
+            <div class="card info-grid reveal">
+                <div class="info-item">
+                    <span class="info-label">Server status</span>
+                    <span class="info-value" id="infoStatus">—</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Local IP address</span>
+                    <span class="info-value info-value--mono" id="infoIp">—</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Server port</span>
+                    <span class="info-value info-value--mono" id="infoPort">—</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Shared folder</span>
+                    <span class="info-value" id="infoFolder">—</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Files available</span>
+                    <span class="info-value" id="infoFiles">—</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- ========================== HOW IT WORKS ======================== -->
+        <section class="section" id="how">
+            <div class="section__head reveal">
+                <span class="section__kicker">Three steps</span>
+                <h2>How it works</h2>
+                <p>From folder to shared link in under a minute.</p>
+            </div>
+
+            <ol class="steps">
+                <li class="step reveal" style="--d:0ms">
+                    <span class="step__num">01</span>
+                    <h3>Select a folder</h3>
+                    <p>
+                        Choose the directory you want to make available. Only that folder is served —
+                        never your entire Mac.
+                    </p>
+                </li>
+                <li class="step reveal" style="--d:120ms">
+                    <span class="step__num">02</span>
+                    <h3>Start hosting &amp; share the link</h3>
+                    <p>
+                        The backend starts the server and returns a URL. Copy it or open it directly
+                        on another device.
+                    </p>
+                </li>
+                <li class="step reveal" style="--d:240ms">
+                    <span class="step__num">03</span>
+                    <h3>Access &amp; stop when finished</h3>
+                    <p>
+                        Browse the files from another device on your network, then stop hosting to
+                        shut the server down immediately.
+                    </p>
+                </li>
+            </ol>
+        </section>
+
+    </main>
+
+    <!-- ============================= FOOTER ============================= -->
+    <footer class="footer">
+        <div class="footer__inner">
+            <div class="footer__brand">
+                <span class="brand__name">LocalShare</span>
+                <p>
+                    A small project built for personal file sharing and for learning how
+                    local servers, HTTP, and browser APIs fit together.
+                </p>
+            </div>
+
+            <p class="footer__warning">
+                <strong>Security reminder:</strong> never share folders containing passwords,
+                private keys, financial records, or anything else sensitive.
+            </p>
+        </div>
+        <p class="footer__meta">LocalShare · Local network sharing only</p>
+    </footer>
+
+    <script src="script.js" defer></script>
+</body>
+
+</html>

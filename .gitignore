@@ -1,0 +1,7 @@
+node_modules/
+.env
+.env.*
+!.env.example
+backend/temp-sessions/
+backend/shared/
+.DS_Store
