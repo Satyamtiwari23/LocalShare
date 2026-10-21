@@ -1,13 +1,10 @@
 
-name: Deploy LocalShare Frontend to GitHub Pages
+name: Deploy LocalShare Frontend
 
 on:
   push:
     branches:
       - main
-    paths:
-      - "frontend/**"
-      - ".github/workflows/deploy-pages.yml"
   workflow_dispatch:
 
 permissions:
@@ -21,10 +18,10 @@ concurrency:
 
 jobs:
   deploy:
+    runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -33,11 +30,11 @@ jobs:
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
-      - name: Upload frontend files
+      - name: Upload frontend
         uses: actions/upload-pages-artifact@v4
         with:
           path: frontend/
 
-      - name: Deploy to GitHub Pages
+      - name: Deploy website
         id: deployment
         uses: actions/deploy-pages@v4
