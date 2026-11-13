@@ -10,8 +10,8 @@
        Configuration
        --------------------------------------------------------- */
     // Leave empty to call the same origin, e.g. "http://localhost:3000"
-    const API_BASE = "";
-
+    const API_BASE = "https://localshare-9dne.onrender.com";
+    
     const ENDPOINTS = {
         status: "/api/status",
         start: "/api/start",
