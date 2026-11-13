@@ -1,705 +1,619 @@
 
 const express = require("express");
 const path = require("path");
-const os = require("os");
 const fs = require("fs");
 const multer = require("multer");
 const crypto = require("crypto");
 
 const app = express();
 
-const DASHBOARD_PORT = 3000;
-const SHARE_PORT = 8000;
+const PORT = process.env.PORT || 3000;
+const FRONTEND_ORIGIN = "https://satyamtiwari23.github.io";
 
-const TEMP_SESSIONS_DIR = path.join(__dirname, "temp-sessions");
+const TEMP_DIR = path.join(__dirname, "temp-sessions");
+
+const MAX_FILE_SIZE = 25 * 1024 * 1024;
+const CHUNK_SIZE = 5 * 1024 * 1024;
+const SESSION_TTL = 2 * 60 * 60 * 1000;
+
+fs.mkdirSync(TEMP_DIR, { recursive: true });
+
+app.set("trust proxy", 1);
+app.use(express.json({ limit: "1mb" }));
+
+// CORS: allow the GitHub Pages frontend.
+app.use((req, res, next) => {
+    const origin = req.headers.origin;
+
+    if (origin === FRONTEND_ORIGIN) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Vary", "Origin");
+        res.setHeader(
+            "Access-Control-Allow-Methods",
+            "GET, POST, OPTIONS"
+        );
+        res.setHeader(
+            "Access-Control-Allow-Headers",
+            "Content-Type"
+        );
+    }
+
+    if (req.method === "OPTIONS") {
+        return res.sendStatus(204);
+    }
+
+    next();
+});
+
+// In-memory session state.
+// Render restarts will reset this state.
+let activeSession = null;
 
 const activeUploads = new Map();
 
-const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB per file
-const CHUNK_SIZE = 10 * 1024 * 1024;     // 10 MB per chunk
-
-let shareServer = null;
-let cloudflaredProcess = null;
-let publicUrl = null;
-let cloudflaredLogs = "";
-
-let activeSessionId = null;
-let activeSessionDir = null;
-
-fs.mkdirSync(TEMP_SESSIONS_DIR, { recursive: true });
-
-const FRONTEND_DIR = path.join(__dirname, "..", "frontend");
-const SHARED_DIR = path.join(__dirname, "shared");
-
-fs.mkdirSync(TEMP_SESSIONS_DIR, { recursive: true });
-
-const upload = multer({
-    storage: multer.diskStorage({
-        destination: (req, file, callback) => {
-            if (!activeSessionDir) {
-                return callback(new Error("No active sharing session."));
-            }
-
-            callback(null, activeSessionDir);
-        },
-
-        filename: (req, file, callback) => {
-            // Generate a safe, unique filename rather than trusting
-            // the original filename for filesystem storage.
-            const safeName = path.basename(file.originalname)
-                .replace(/[^a-zA-Z0-9._-]/g, "_")
-                .slice(-150) || "uploaded-file";
-
-            callback(null, `${crypto.randomUUID()}-${safeName}`);
-        }
-    }),
-
-    limits: {
-        fileSize: 10 * 1024 * 1024, // 100 MB per file
-        files: 1                  // Maximum 20 files per request
-    }
-});
-
-
-app.use(express.json());
-
-
-const chunkStorage = multer.memoryStorage();
-
 const chunkUpload = multer({
-    storage: chunkStorage,
+    storage: multer.memoryStorage(),
     limits: {
-        fileSize: 10 * 1024 * 1024, // 10 MB per chunk
+        fileSize: CHUNK_SIZE,
         files: 1
     }
 });
 
+function safeFileName(name) {
+    return path.basename(name)
+        .replace(/[^a-zA-Z0-9._-]/g, "_")
+        .slice(-150) || "uploaded-file";
+}
 
-app.post("/api/upload/init", (req, res) => {
-    if (!activeSessionDir || !activeSessionId) {
-        return res.status(400).json({
-            ok: false,
-            error: "Start a sharing session before uploading."
-        });
-    }
+function getBaseUrl(req) {
+    return process.env.RENDER_EXTERNAL_URL ||
+        `${req.protocol}://${req.get("host")}`;
+}
 
-    const { uploadId, fileName, fileSize, totalChunks } = req.body;
+function countFiles(directory) {
+    if (!directory || !fs.existsSync(directory)) return 0;
 
-    if (
-        typeof uploadId !== "string" ||
-        !/^[a-zA-Z0-9_-]{1,100}$/.test(uploadId) ||
-        typeof fileName !== "string" ||
-        !fileName.trim() ||
-        !Number.isSafeInteger(fileSize) ||
-        fileSize < 1 ||
-        fileSize > MAX_FILE_SIZE ||
-        !Number.isSafeInteger(totalChunks) ||
-        totalChunks !== Math.ceil(fileSize / CHUNK_SIZE)
-    ) {
-        return res.status(400).json({
-            ok: false,
-            error: "Invalid upload details or file exceeds the 100 MB limit."
-        });
-    }
+    return fs.readdirSync(directory, { withFileTypes: true })
+        .reduce((count, entry) => {
+            if (entry.name.startsWith(".")) return count;
 
-    if (activeUploads.has(uploadId)) {
-        return res.status(409).json({
-            ok: false,
-            error: "This upload ID is already registered."
-        });
-    }
+            const fullPath = path.join(directory, entry.name);
 
-    activeUploads.set(uploadId, {
-        sessionId: activeSessionId,
-        fileName: fileName.trim(),
-        fileSize,
-        totalChunks,
-        receivedChunks: new Set()
-    });
+            if (entry.isDirectory()) {
+                return count + countFiles(fullPath);
+            }
 
-    return res.json({
+            return count + 1;
+        }, 0);
+}
+
+function getStatus(req) {
+    const running = Boolean(activeSession);
+
+    return {
         ok: true,
-        uploadId,
-        chunkSize: CHUNK_SIZE,
-        totalChunks
+        running,
+        status: running ? "running" : "stopped",
+        folderName: "Temporary session folder",
+        folder: "Temporary session folder",
+        localIp: "Cloud hosted",
+        port: PORT,
+        url: running ? activeSession.publicUrl : "",
+        publicUrl: running ? activeSession.publicUrl : "",
+        scope: "public",
+        filesAvailable: running
+            ? countFiles(activeSession.directory)
+            : 0
+    };
+}
+
+function requireActiveSession(req, res, next) {
+    if (!activeSession) {
+        return res.status(400).json({
+            ok: false,
+            error: "No active sharing session. Start hosting first."
+        });
+    }
+
+    next();
+}
+
+// Health check.
+app.get("/", (req, res) => {
+    res.json({
+        ok: true,
+        service: "LocalShare API",
+        status: "online"
     });
 });
 
+app.get("/api/status", (req, res) => {
+    res.json(getStatus(req));
+});
 
-
-app.post(
-    "/api/upload/chunk",
-    chunkUpload.single("chunk"),
-    async (req, res) => {
-        try {
-            if (!activeSessionDir || !activeSessionId) {
-                return res.status(400).json({
-                    ok: false,
-                    error: "No active sharing session."
-                });
-            }
-
-            const { uploadId, chunkIndex } = req.body;
-
-            if (
-                typeof uploadId !== "string" ||
-                !/^[a-zA-Z0-9_-]{1,100}$/.test(uploadId) ||
-                !/^\d+$/.test(chunkIndex) ||
-                !req.file
-            ) {
-                return res.status(400).json({
-                    ok: false,
-                    error: "Invalid chunk upload data."
-                });
-            }
-
-            const index = Number(chunkIndex);
-            const upload = activeUploads.get(uploadId);
-
-            if (
-                !upload ||
-                upload.sessionId !== activeSessionId ||
-                !Number.isSafeInteger(index) ||
-                index < 0 ||
-                index >= upload.totalChunks
-            ) {
-                return res.status(400).json({
-                    ok: false,
-                    error: "Upload not registered or chunk index invalid."
-                });
-            }
-
-            if (upload.receivedChunks.has(index)) {
-                return res.status(409).json({
-                    ok: false,
-                    error: "This chunk has already been received."
-                });
-            }
-
-            // Verify the expected size of this chunk.
-            const expectedChunkSize = Math.min(
-                CHUNK_SIZE,
-                upload.fileSize - index * CHUNK_SIZE
-            );
-
-            if (req.file.size !== expectedChunkSize) {
-                return res.status(400).json({
-                    ok: false,
-                    error: "Chunk size does not match the expected size."
-                });
-            }
-
-            const chunkDir = path.join(
-                activeSessionDir,
-                ".chunks",
-                uploadId
-            );
-
-            await fs.promises.mkdir(chunkDir, { recursive: true });
-
-            const chunkPath = path.join(chunkDir, `${index}.part`);
-
-            await fs.promises.writeFile(chunkPath, req.file.buffer, {
-                flag: "wx"
-            });
-
-            upload.receivedChunks.add(index);
-
-            return res.json({
-                ok: true,
-                uploadId,
-                chunkIndex: index,
-                receivedBytes: req.file.size
-            });
-        } catch (error) {
-            console.error("Chunk upload failed:", error.message);
-
-            return res.status(500).json({
-                ok: false,
-                error: "Could not save the uploaded chunk."
-            });
-        }
-    }
-);
-
-
-
-
-app.post("/api/upload/finalize", async (req, res) => {
+// Start one sharing session.
+app.post("/api/start", async (req, res) => {
     try {
-        if (!activeSessionDir || !activeSessionId) {
-            return res.status(400).json({
+        if (activeSession) {
+            return res.status(409).json({
                 ok: false,
-                error: "No active sharing session."
+                error: "Server Busy. A sharing session is already active."
             });
         }
 
-        const { uploadId, fileName, totalChunks, fileSize } = req.body;
+        const sessionId = crypto.randomUUID();
+        const directory = path.join(TEMP_DIR, sessionId);
+
+        await fs.promises.mkdir(directory, { recursive: true });
+
+        const publicUrl =
+            `${getBaseUrl(req)}/s/${sessionId}`;
+
+        activeSession = {
+            id: sessionId,
+            directory,
+            publicUrl,
+            startedAt: Date.now()
+        };
+
+        activeUploads.clear();
+
+        console.log("LocalShare session started:", sessionId);
+
+        res.json({
+            ...getStatus(req),
+            ok: true,
+            running: true,
+            status: "running",
+            url: publicUrl,
+            publicUrl,
+            scope: "public"
+        });
+    } catch (error) {
+        console.error("Start session failed:", error);
+
+        res.status(500).json({
+            ok: false,
+            error: "Could not start sharing session."
+        });
+    }
+});
+
+// Initialize a file upload.
+app.post(
+    "/api/upload/init",
+    requireActiveSession,
+    (req, res) => {
+        const {
+            uploadId,
+            fileName,
+            fileSize,
+            totalChunks
+        } = req.body || {};
 
         if (
             typeof uploadId !== "string" ||
             !/^[a-zA-Z0-9_-]{1,100}$/.test(uploadId) ||
             typeof fileName !== "string" ||
             !fileName.trim() ||
-            !Number.isSafeInteger(totalChunks) ||
-            totalChunks < 1 ||
             !Number.isSafeInteger(fileSize) ||
             fileSize < 1 ||
-            fileSize > MAX_FILE_SIZE
+            fileSize > MAX_FILE_SIZE ||
+            !Number.isSafeInteger(totalChunks) ||
+            totalChunks !== Math.ceil(fileSize / CHUNK_SIZE)
         ) {
             return res.status(400).json({
                 ok: false,
-                error: "Invalid upload metadata or file exceeds the 100 MB limit."
+                error: "Invalid upload details. Maximum file size is 25 MB."
             });
         }
 
-        const upload = activeUploads.get(uploadId);
-
-        if (
-            !upload ||
-            upload.sessionId !== activeSessionId ||
-            upload.fileName !== fileName ||
-            upload.totalChunks !== totalChunks ||
-            upload.fileSize !== fileSize
-        ) {
-            return res.status(400).json({
+        if (activeUploads.has(uploadId)) {
+            return res.status(409).json({
                 ok: false,
-                error: "Upload metadata does not match the active upload."
+                error: "Upload ID already exists."
             });
         }
 
-        if (upload.receivedChunks.size !== upload.totalChunks) {
-            return res.status(400).json({
-                ok: false,
-                message: "Upload incomplete. Some chunks are missing."
-            });
-        }
+        activeUploads.set(uploadId, {
+            sessionId: activeSession.id,
+            fileName: fileName.trim(),
+            fileSize,
+            totalChunks,
+            receivedChunks: new Set()
+        });
 
-        const chunkDir = path.join(
-            activeSessionDir,
-            ".chunks",
-            uploadId
-        );
-
-        const outputName = `${crypto.randomUUID()}-${path.basename(fileName)
-            .replace(/[^a-zA-Z0-9._-]/g, "_")
-            .slice(-150) || "uploaded-file"}`;
-
-        const outputPath = path.join(activeSessionDir, outputName);
-        const output = fs.createWriteStream(outputPath, { flags: "wx" });
-
-        let writtenBytes = 0;
-
-        try {
-            for (let i = 0; i < totalChunks; i++) {
-                const chunkPath = path.join(chunkDir, `${i}.part`);
-                const chunk = await fs.promises.readFile(chunkPath);
-
-                writtenBytes += chunk.length;
-
-                if (writtenBytes > fileSize) {
-                    throw new Error("Uploaded chunks exceed the declared file size.");
-                }
-
-                if (!output.write(chunk)) {
-                    await new Promise(resolve => output.once("drain", resolve));
-                }
-            }
-
-            if (writtenBytes !== fileSize) {
-                throw new Error("Uploaded chunks do not match the declared file size.");
-            }
-
-            await new Promise((resolve, reject) => {
-                output.end(resolve);
-                output.on("error", reject);
-            });
-
-            await fs.promises.rm(chunkDir, { recursive: true, force: true });
-            activeUploads.delete(uploadId);
-
-            return res.json({
-                ok: true,
-                fileName,
-                storedName: outputName,
-                fileSize: writtenBytes,
-                message: "File assembled successfully."
-            });
-        } catch (error) {
-            output.destroy();
-            await fs.promises.rm(outputPath, { force: true });
-            throw error;
-        }
-    } catch (error) {
-        console.error("Finalize upload failed:", error.message);
-
-        return res.status(500).json({
-            ok: false,
-            error: "Could not assemble the uploaded file."
+        res.json({
+            ok: true,
+            uploadId,
+            chunkSize: CHUNK_SIZE,
+            totalChunks
         });
     }
-});
+);
 
+// Receive an individual chunk.
+app.post(
+    "/api/upload/chunk",
+    requireActiveSession,
+    chunkUpload.single("chunk"),
+    async (req, res) => {
+        try {
+            const { uploadId, chunkIndex } = req.body || {};
 
+            const upload = activeUploads.get(uploadId);
+            const index = Number(chunkIndex);
 
-// Ensure the shared directory exists.
-fs.mkdirSync(SHARED_DIR, { recursive: true });
-
-// Serve the dashboard frontend.
-app.use(express.static(FRONTEND_DIR));
-
-// Find a usable local IPv4 address.
-function getLocalIP() {
-    const interfaces = os.networkInterfaces();
-
-    for (const entries of Object.values(interfaces)) {
-        for (const info of entries || []) {
             if (
-                info.family === "IPv4" &&
-                !info.internal &&
-                !info.address.startsWith("169.254.")
+                !upload ||
+                upload.sessionId !== activeSession.id ||
+                !Number.isSafeInteger(index) ||
+                index < 0 ||
+                index >= upload.totalChunks ||
+                !req.file
             ) {
-                return info.address;
+                return res.status(400).json({
+                    ok: false,
+                    error: "Invalid upload or chunk."
+                });
             }
-        }
-    }
 
-    return "localhost";
-}
-
-
-
-function startCloudflareTunnel() {
-    return new Promise((resolve, reject) => {
-        if (cloudflaredProcess) {
-            return reject(new Error("Cloudflare Tunnel is already running."));
-        }
-
-        const { spawn } = require("child_process");
-
-        publicUrl = null;
-        cloudflaredLogs = "";
-
-        cloudflaredProcess = spawn(
-            "cloudflared",
-            ["tunnel", "--url", `http://localhost:${SHARE_PORT}`],
-            { stdio: ["ignore", "pipe", "pipe"] }
-        );
-
-        let settled = false;
-
-        const timeout = setTimeout(() => {
-            if (!settled) {
-                settled = true;
-                reject(new Error(
-                    "Cloudflare URL was not generated in time. Check your internet connection and cloudflared logs."
-                ));
+            if (upload.receivedChunks.has(index)) {
+                return res.status(409).json({
+                    ok: false,
+                    error: "Chunk already received."
+                });
             }
-        }, 30000);
 
-        function handleOutput(chunk) {
-            const output = chunk.toString();
-            cloudflaredLogs = (cloudflaredLogs + output).slice(-10000);
-
-            const match = output.match(
-                /https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/
+            const expectedSize = Math.min(
+                CHUNK_SIZE,
+                upload.fileSize - index * CHUNK_SIZE
             );
 
-            if (match) {
-                publicUrl = match[0];
-
-                if (!settled) {
-                    settled = true;
-                    clearTimeout(timeout);
-                    resolve(publicUrl);
-                }
+            if (req.file.size !== expectedSize) {
+                return res.status(400).json({
+                    ok: false,
+                    error: "Incorrect chunk size."
+                });
             }
-        }
 
-        cloudflaredProcess.stdout.on("data", handleOutput);
-        cloudflaredProcess.stderr.on("data", handleOutput);
+            const chunkDirectory = path.join(
+                activeSession.directory,
+                ".chunks",
+                uploadId
+            );
 
-        cloudflaredProcess.on("error", (error) => {
-            clearTimeout(timeout);
-            cloudflaredProcess = null;
-
-            if (!settled) {
-                settled = true;
-                reject(error);
-            }
-        });
-
-        cloudflaredProcess.on("close", (code) => {
-            cloudflaredProcess = null;
-            publicUrl = null;
-
-            if (!settled) {
-                settled = true;
-                clearTimeout(timeout);
-                reject(new Error(
-                    `Cloudflare Tunnel exited before generating a URL (code ${code}).`
-                ));
-            }
-        });
-    });
-}
-
-
-
-
-function getStatus() {
-    const running = Boolean(shareServer?.listening);
-    const localIP = getLocalIP();
-
-    let fileCount = 0;
-
-    function countFiles(directory) {
-        if (!fs.existsSync(directory)) return 0;
-
-        return fs.readdirSync(directory, { withFileTypes: true })
-            .reduce((count, entry) => {
-                // Ignore internal chunk directories and hidden files.
-                if (entry.name.startsWith(".")) return count;
-
-                const fullPath = path.join(directory, entry.name);
-
-                if (entry.isDirectory()) {
-                    return count + countFiles(fullPath);
-                }
-
-                return count + 1;
-            }, 0);
-    }
-
-    if (activeSessionDir) {
-        fileCount = countFiles(activeSessionDir);
-    }
-
-    return {
-        ok: true,
-        running,
-        status: running ? "running" : "stopped",
-        folderName: "shared",
-        folder: "shared",
-        localIp: localIP,
-        port: SHARE_PORT,
-        url: publicUrl || (running ? `http://${localIP}:${SHARE_PORT}` : ""),
-        publicUrl: publicUrl || "",
-        scope: publicUrl ? "public internet" : "local network",
-        cloudflareRunning: Boolean(cloudflaredProcess),
-        filesAvailable: fileCount
-    };
-}
-
-
-// Dashboard status API.
-app.get("/api/status", (req, res) => {
-    res.json(getStatus());
-});
-
-
-app.post("/api/start", async (req, res) => {
-    if (shareServer?.listening) {
-        return res.json(getStatus());
-    }
-
-    // Create a fresh temporary upload session.
-    activeSessionId = crypto.randomUUID();
-    activeSessionDir = path.join(TEMP_SESSIONS_DIR, activeSessionId);
-
-    await fs.promises.mkdir(activeSessionDir, { recursive: true });
-
-    activeUploads.clear();
-
-    const shareApp = express();
-
-    shareApp.get("/", (req, res) => {
-        res.send(`
-      <!DOCTYPE html>
-      <html lang="en">
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>LocalShare</title>
-      </head>
-      <body style="font-family:Arial,sans-serif;max-width:800px;margin:40px auto;padding:20px">
-        <h1>LocalShare</h1>
-        <p>Files shared from this device</p>
-        <div id="files">Loading files...</div>
-        <script>
-          fetch("/api/files")
-            .then(r => r.json())
-            .then(files => {
-              const container = document.getElementById("files");
-              container.textContent = "";
-
-              if (!files.length) {
-                container.textContent = "No files shared yet.";
-                return;
-              }
-
-              files.forEach(file => {
-                const row = document.createElement("p");
-                const link = document.createElement("a");
-                link.href = file.url;
-                link.textContent = file.name;
-                row.appendChild(link);
-                container.appendChild(row);
-              });
-            })
-            .catch(() => {
-              document.getElementById("files").textContent =
-                "Could not load files.";
+            await fs.promises.mkdir(chunkDirectory, {
+                recursive: true
             });
-        </script>
-      </body>
-      </html>
-    `);
-    });
 
-    shareApp.get("/api/files", (req, res) => {
-        function listFiles(directory, relative = "") {
-            return fs.readdirSync(directory, { withFileTypes: true })
-                .flatMap(entry => {
-                    if (entry.name.startsWith(".")) return [];
+            await fs.promises.writeFile(
+                path.join(chunkDirectory, `${index}.part`),
+                req.file.buffer,
+                { flag: "wx" }
+            );
 
-                    const absolute = path.join(directory, entry.name);
-                    const relativePath = path.posix.join(relative, entry.name);
+            upload.receivedChunks.add(index);
 
-                    if (entry.isDirectory()) {
-                        return listFiles(absolute, relativePath);
+            res.json({
+                ok: true,
+                uploadId,
+                chunkIndex: index
+            });
+        } catch (error) {
+            console.error("Chunk upload failed:", error);
+
+            res.status(500).json({
+                ok: false,
+                error: "Could not save file chunk."
+            });
+        }
+    }
+);
+
+// Assemble all chunks into one file.
+app.post(
+    "/api/upload/finalize",
+    requireActiveSession,
+    async (req, res) => {
+        try {
+            const {
+                uploadId,
+                fileName,
+                totalChunks,
+                fileSize
+            } = req.body || {};
+
+            const upload = activeUploads.get(uploadId);
+
+            if (
+                !upload ||
+                upload.sessionId !== activeSession.id ||
+                upload.fileName !== fileName ||
+                upload.totalChunks !== totalChunks ||
+                upload.fileSize !== fileSize
+            ) {
+                return res.status(400).json({
+                    ok: false,
+                    error: "Upload details do not match."
+                });
+            }
+
+            if (upload.receivedChunks.size !== totalChunks) {
+                return res.status(400).json({
+                    ok: false,
+                    error: "Some chunks are missing."
+                });
+            }
+
+            const chunkDirectory = path.join(
+                activeSession.directory,
+                ".chunks",
+                uploadId
+            );
+
+            const storedName =
+                `${crypto.randomUUID()}-${safeFileName(fileName)}`;
+
+            const outputPath = path.join(
+                activeSession.directory,
+                storedName
+            );
+
+            const output = fs.createWriteStream(outputPath, {
+                flags: "wx"
+            });
+
+            let writtenBytes = 0;
+
+            try {
+                for (let index = 0; index < totalChunks; index++) {
+                    const chunkPath = path.join(
+                        chunkDirectory,
+                        `${index}.part`
+                    );
+
+                    const chunk = await fs.promises.readFile(chunkPath);
+
+                    writtenBytes += chunk.length;
+
+                    if (writtenBytes > fileSize) {
+                        throw new Error("File size exceeded.");
                     }
 
-                    return [{
-                        name: relativePath,
-                        url: "/" + relativePath
-                            .split("/")
-                            .map(encodeURIComponent)
-                            .join("/")
-                    }];
+                    if (!output.write(chunk)) {
+                        await new Promise(resolve =>
+                            output.once("drain", resolve)
+                        );
+                    }
+                }
+
+                if (writtenBytes !== fileSize) {
+                    throw new Error("File size mismatch.");
+                }
+
+                await new Promise((resolve, reject) => {
+                    output.once("error", reject);
+                    output.end(resolve);
                 });
+
+                await fs.promises.rm(chunkDirectory, {
+                    recursive: true,
+                    force: true
+                });
+
+                activeUploads.delete(uploadId);
+
+                res.json({
+                    ok: true,
+                    fileName,
+                    storedName,
+                    fileSize: writtenBytes,
+                    message: "File uploaded successfully."
+                });
+            } catch (error) {
+                output.destroy();
+
+                await fs.promises.rm(outputPath, {
+                    force: true
+                });
+
+                throw error;
+            }
+        } catch (error) {
+            console.error("Finalize failed:", error);
+
+            res.status(500).json({
+                ok: false,
+                error: "Could not assemble uploaded file."
+            });
         }
-
-        res.json(listFiles(activeSessionDir));
-    });
-
-    shareApp.use(express.static(activeSessionDir, {
-        dotfiles: "ignore",
-        index: false,
-        setHeaders(res) {
-            res.setHeader("Content-Disposition", "inline");
-        }
-    }));
-
-    const server = shareApp.listen(SHARE_PORT, "0.0.0.0");
-
-    server.once("error", (error) => {
-        console.error("Sharing server error:", error.message);
-    });
-
-    try {
-        await new Promise((resolve, reject) => {
-            server.once("listening", resolve);
-            server.once("error", reject);
-        });
-
-        shareServer = server;
-
-        await startCloudflareTunnel();
-
-        res.json(getStatus());
-    } catch (error) {
-        console.error("Hosting startup failed:", error.message);
-
-        if (shareServer?.listening) {
-            await new Promise(resolve => shareServer.close(resolve));
-        } else if (server.listening) {
-            await new Promise(resolve => server.close(resolve));
-        }
-
-        shareServer = null;
-
-        if (cloudflaredProcess) {
-            cloudflaredProcess.kill("SIGTERM");
-            cloudflaredProcess = null;
-        }
-
-        publicUrl = null;
-
-        res.status(500).json({
-            ok: false,
-            error: error.message
-        });
     }
+);
+
+// List files in a public sharing session.
+app.get("/s/:sessionId", (req, res) => {
+    if (
+        !activeSession ||
+        req.params.sessionId !== activeSession.id
+    ) {
+        return res.status(404).send("This sharing session is no longer available.");
+    }
+
+    res.type("html").send(`
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>LocalShare - Shared Files</title>
+            <style>
+                body {
+                    font-family: Arial, sans-serif;
+                    max-width: 800px;
+                    margin: 40px auto;
+                    padding: 20px;
+                    background: #101827;
+                    color: white;
+                }
+                a { color: #60a5fa; }
+                li { margin: 14px 0; }
+            </style>
+        </head>
+        <body>
+            <h1>LocalShare</h1>
+            <p>Files shared with you</p>
+            <div id="files">Loading files...</div>
+            <script>
+                fetch("/s/${req.params.sessionId}/files")
+                    .then(response => {
+                        if (!response.ok) throw new Error("Unavailable");
+                        return response.json();
+                    })
+                    .then(files => {
+                        const container = document.getElementById("files");
+                        container.textContent = "";
+
+                        if (!files.length) {
+                            container.textContent = "No files shared yet.";
+                            return;
+                        }
+
+                        const list = document.createElement("ul");
+
+                        files.forEach(file => {
+                            const item = document.createElement("li");
+                            const link = document.createElement("a");
+
+                            link.href = file.url;
+                            link.textContent = file.name;
+                            link.download = file.name;
+
+                            item.appendChild(link);
+                            list.appendChild(item);
+                        });
+
+                        container.appendChild(list);
+                    })
+                    .catch(() => {
+                        document.getElementById("files").textContent =
+                            "Could not load shared files.";
+                    });
+            </script>
+        </body>
+        </html>
+    `);
 });
 
+app.get("/s/:sessionId/files", (req, res) => {
+    if (
+        !activeSession ||
+        req.params.sessionId !== activeSession.id
+    ) {
+        return res.status(404).json({
+            error: "Sharing session not found."
+        });
+    }
 
-// Stop sharing.
+    const files = fs.readdirSync(activeSession.directory, {
+        withFileTypes: true
+    })
+        .filter(entry =>
+            entry.isFile() && !entry.name.startsWith(".")
+        )
+        .map(entry => ({
+            name: entry.name.replace(/^[0-9a-f-]{36}-/i, ""),
+            url: `/s/${activeSession.id}/file/${encodeURIComponent(entry.name)}`
+        }));
 
+    res.json(files);
+});
+
+// Download a shared file.
+app.get("/s/:sessionId/file/:fileName", (req, res) => {
+    if (
+        !activeSession ||
+        req.params.sessionId !== activeSession.id
+    ) {
+        return res.status(404).send("Sharing session not found.");
+    }
+
+    const fileName = path.basename(req.params.fileName);
+    const filePath = path.join(activeSession.directory, fileName);
+
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+        return res.status(404).send("File not found.");
+    }
+
+    res.download(filePath, fileName.replace(/^[0-9a-f-]{36}-/i, ""));
+});
+
+// Stop hosting and delete temporary files.
 app.post("/api/stop", async (req, res) => {
     try {
-        // Stop the Cloudflare tunnel first.
-        const tunnel = cloudflaredProcess;
-        cloudflaredProcess = null;
-        publicUrl = null;
-
-        if (tunnel && !tunnel.killed) {
-            await new Promise(resolve => {
-                const forceTimeout = setTimeout(() => {
-                    if (tunnel.exitCode === null) {
-                        tunnel.kill("SIGKILL");
-                    }
-                    resolve();
-                }, 5000);
-
-                tunnel.once("close", () => {
-                    clearTimeout(forceTimeout);
-                    resolve();
-                });
-
-                tunnel.kill("SIGTERM");
-            });
-        }
-
-        // Stop the file-sharing server.
-        const server = shareServer;
-        shareServer = null;
-
-        if (server?.listening) {
-            await new Promise((resolve, reject) => {
-                server.close(error => {
-                    if (error) reject(error);
-                    else resolve();
-                });
-            });
-        }
-
-        // Delete temporary files and reset the active session.
-        if (activeSessionDir) {
-            await fs.promises.rm(activeSessionDir, {
+        if (activeSession) {
+            await fs.promises.rm(activeSession.directory, {
                 recursive: true,
                 force: true
             });
         }
 
-        activeSessionDir = null;
-        activeSessionId = null;
+        activeSession = null;
         activeUploads.clear();
 
-        return res.json(getStatus());
+        res.json({
+            ok: true,
+            running: false,
+            status: "stopped",
+            filesAvailable: 0
+        });
     } catch (error) {
-        console.error("Stop Hosting failed:", error.message);
+        console.error("Stop failed:", error);
 
-        return res.status(500).json({
+        res.status(500).json({
             ok: false,
-            error: "Could not stop hosting: " + error.message
+            error: "Could not stop sharing."
         });
     }
 });
 
+// Automatically expire old sessions.
+const cleanupTimer = setInterval(async () => {
+    if (
+        activeSession &&
+        Date.now() - activeSession.startedAt > SESSION_TTL
+    ) {
+        console.log("Expiring LocalShare session.");
 
-// Start the dashboard backend.
-app.listen(DASHBOARD_PORT, "127.0.0.1", () => {
-    console.log(`LocalShare dashboard: http://localhost:${DASHBOARD_PORT}`);
-    console.log(`Files to share: ${SHARED_DIR}`);
+        await fs.promises.rm(activeSession.directory, {
+            recursive: true,
+            force: true
+        }).catch(console.error);
+
+        activeSession = null;
+        activeUploads.clear();
+    }
+}, 60 * 1000);
+
+cleanupTimer.unref();
+
+// Handle unexpected errors.
+app.use((error, req, res, next) => {
+    console.error("Server error:", error);
+
+    if (error instanceof multer.MulterError) {
+        return res.status(400).json({
+            ok: false,
+            error: "Upload error: " + error.message
+        });
+    }
+
+    res.status(500).json({
+        ok: false,
+        error: "Internal server error."
+    });
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+    console.log(`LocalShare backend running on port ${PORT}`);
 });
